@@ -1,4 +1,8 @@
 # `m2c` Decompiler
+
+> **This is a fork** of [matt-kempster/m2c](https://github.com/matt-kempster/m2c), branch `armcc`:
+> it adds a `ctr` target (ARM with hard-float VFP, as armcc builds 3DS code). What changed is in
+> [FORK.md](FORK.md). Everything else is upstream's, under the same license (GPL-3.0).
 `m2c` ("*Machine code to C*") is a decompiler for 32-bit MIPS, ARM, PowerPC and SuperH assembly that produces C code, with partial support for C++.
 
 This project, initially named `mips_to_c`, has the goal to support decompilation projects, which aim to write source code that yields byte-identical output when compiled with a particular build system.
