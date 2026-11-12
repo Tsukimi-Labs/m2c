@@ -42,6 +42,7 @@ class Target:
         PPC = "ppc"
         ARM = "arm"
         GBA = "gba"
+        CTR = "ctr"
         SH2 = "sh2"
         SH4 = "sh4"
 
@@ -58,6 +59,8 @@ class Target:
             elif self == Target.PlatformEnum.ARM:
                 return Target.ArchEnum.ARM
             elif self == Target.PlatformEnum.GBA:
+                return Target.ArchEnum.ARM
+            elif self == Target.PlatformEnum.CTR:
                 return Target.ArchEnum.ARM
             elif self in (Target.PlatformEnum.SH2, Target.PlatformEnum.SH4):
                 return Target.ArchEnum.SH
@@ -110,6 +113,7 @@ class Target:
                 Target.PlatformEnum.MIPSEE,
                 Target.PlatformEnum.ARM,
                 Target.PlatformEnum.GBA,
+                Target.PlatformEnum.CTR,
                 Target.PlatformEnum.SH4,
             ):
                 endian = Target.EndianEnum.LITTLE

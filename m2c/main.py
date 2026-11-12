@@ -26,7 +26,7 @@ from .translate import (
     visualize_flowgraph,
 )
 from .types import TypePool
-from .arch_arm import ArmArch, ArmGbaArch
+from .arch_arm import ArmArch, ArmCtrArch, ArmGbaArch
 from .arch_mips import MipsArch, MipseeArch
 from .arch_ppc import PpcArch
 from .arch_sh import Sh2Arch, Sh4Arch
@@ -132,6 +132,8 @@ def run(options: Options) -> int:
     elif options.target.arch == Target.ArchEnum.ARM:
         if options.target.platform == Target.PlatformEnum.GBA:
             arch = ArmGbaArch()
+        elif options.target.platform == Target.PlatformEnum.CTR:
+            arch = ArmCtrArch()
         else:
             arch = ArmArch()
     elif options.target.arch == Target.ArchEnum.SH:

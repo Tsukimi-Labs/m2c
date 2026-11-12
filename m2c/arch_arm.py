@@ -51,6 +51,7 @@ from .translate import (
     Arch,
     BinaryOp,
     CarryBit,
+    Cast,
     Condition,
     ErrorExpr,
     ExprStmt,
@@ -180,6 +181,79 @@ SUFFIXABLE_INSTRUCTIONS: Set[str] = {
     "vldr",
     "vstm",
     "vstr",
+    # armcc (3DS): media extensions, double-word memory, and the VFP forms normalized below
+    "uxtb",
+    "uxth",
+    "sxtb",
+    "sxth",
+    "ldrd",
+    "strd",
+    "add.s.fictive",
+    "sub.s.fictive",
+    "mul.s.fictive",
+    "div.s.fictive",
+    "sqrt.s.fictive",
+    "neg.s.fictive",
+    "abs.s.fictive",
+    "nmul.s.fictive",
+    "mla.s.fictive",
+    "mls.s.fictive",
+    "nmla.s.fictive",
+    "nmls.s.fictive",
+    "mov.s.fictive",
+    "movimm.s.fictive",
+    "vmov.fictive",
+    "cvt.s.w.fictive",
+    "cvt.s.u.fictive",
+    "cvt.w.s.fictive",
+    "cvt.u.s.fictive",
+    "fcmp.s.fictive",
+}
+
+# VFP instructions, as GNU/capstone print them (vaddgt.f32), and the fictive
+# single-precision instruction each becomes. the longest bases come first, so
+# that vcmpe is not read as vcmp + e.
+VFP_BASES = [
+    "vcmpe",
+    "vcmp",
+    "vnmul",
+    "vnmla",
+    "vnmls",
+    "vadd",
+    "vsub",
+    "vmul",
+    "vdiv",
+    "vsqrt",
+    "vneg",
+    "vabs",
+    "vmla",
+    "vmls",
+    "vmov",
+    "vcvtr",
+    "vcvt",
+    "vmrs",
+]
+VFP_F32 = {
+    "vadd": "add.s.fictive",
+    "vsub": "sub.s.fictive",
+    "vmul": "mul.s.fictive",
+    "vdiv": "div.s.fictive",
+    "vsqrt": "sqrt.s.fictive",
+    "vneg": "neg.s.fictive",
+    "vabs": "abs.s.fictive",
+    "vnmul": "nmul.s.fictive",
+    "vmla": "mla.s.fictive",
+    "vmls": "mls.s.fictive",
+    "vnmla": "nmla.s.fictive",
+    "vnmls": "nmls.s.fictive",
+    "vcmp": "fcmp.s.fictive",
+    "vcmpe": "fcmp.s.fictive",
+}
+VFP_CVT = {
+    "f32.s32": "cvt.s.w.fictive",
+    "f32.u32": "cvt.s.u.fictive",
+    "s32.f32": "cvt.w.s.fictive",
+    "u32.f32": "cvt.u.s.fictive",
 }
 
 LENGTH_THREE: Set[str] = {
@@ -439,6 +513,87 @@ def parse_suffix(mnemonic: str) -> Tuple[str, Optional[Cc], str, str]:
     return orig_mn + memsize, None, "", ""
 
 
+def normalize_vfp(instr: AsmInstruction) -> Optional[AsmInstruction]:
+    """A VFP instruction as the fictive instruction that does the same, or None."""
+    mnemonic = instr.mnemonic
+    if not mnemonic.startswith("v"):
+        return None
+    head, _, types = mnemonic.partition(".")
+    conds = [c.value for c in Cc if c != Cc.AL] + ["hs", "lo"]
+    for vbase in VFP_BASES:
+        if head.startswith(vbase):
+            cc = head[len(vbase) :]
+            if cc == "" or cc in conds:
+                break
+    else:
+        return None
+    if cc == "hs":
+        cc = "cs"
+    elif cc == "lo":
+        cc = "cc"
+    args = instr.args
+    if vbase == "vmrs":
+        # vmrs APSR_nzcv, fpscr: the flags were already set by the vcmp before it
+        if args and str(args[0]).lower().startswith("apsr"):
+            return AsmInstruction("nop", [])
+        return None
+    if vbase == "vmov":
+        if types == "f32" and len(args) == 2:
+            if isinstance(args[1], AsmLiteral):
+                return AsmInstruction("movimm.s.fictive" + cc, args)
+            return AsmInstruction("mov.s.fictive" + cc, args)
+        if types == "" and len(args) == 2:
+            return AsmInstruction("vmov.fictive" + cc, args)
+        return None
+    if vbase in ("vcvt", "vcvtr"):
+        fictive = VFP_CVT.get(types)
+        return AsmInstruction(fictive + cc, args) if fictive else None
+    if types != "f32" or vbase not in VFP_F32:
+        return None
+    return AsmInstruction(VFP_F32[vbase] + cc, args)
+
+
+class DoubleWordPattern(AsmPattern):
+    """Replace ldrd/strd by two ldr/str."""
+
+    def match(self, matcher: AsmMatcher) -> Optional[Replacement]:
+        instr = matcher.input[matcher.index]
+        if not isinstance(instr, Instruction) or len(instr.args) != 3:
+            return None
+        base, cc, set_flags, direction = parse_suffix(instr.mnemonic)
+        if base not in ("ldrd", "strd"):
+            return None
+        first, second, addr = instr.args
+        if (
+            not isinstance(first, Register)
+            or not isinstance(second, Register)
+            or not isinstance(addr, AsmAddressMode)
+            or not isinstance(addr.addend, AsmLiteral)
+        ):
+            return None
+        single = base[:3] + (cc.value if cc else "")
+        off = addr.addend.value
+        reg = addr.base
+        if addr.writeback is None:
+            pairs = [
+                (first, AsmAddressMode(reg, AsmLiteral(off), None)),
+                (second, AsmAddressMode(reg, AsmLiteral(off + 4), None)),
+            ]
+            if base == "ldrd" and first == reg:
+                pairs.reverse()
+        elif addr.writeback == Writeback.PRE:
+            pairs = [
+                (first, addr),
+                (second, AsmAddressMode(reg, AsmLiteral(4), None)),
+            ]
+        else:
+            pairs = [
+                (second, AsmAddressMode(reg, AsmLiteral(4), None)),
+                (first, addr),
+            ]
+        return Replacement([AsmInstruction(single, [r, m]) for r, m in pairs], 1)
+
+
 def get_ldm_stm_offset(i: int, num_regs: int, direction: str) -> int:
     if direction == "ia":
         return 4 * i
@@ -449,6 +604,19 @@ def get_ldm_stm_offset(i: int, num_regs: int, direction: str) -> int:
     if direction == "db":
         return 4 * (i - num_regs)
     assert False, f"bad ldm/stm direction {direction}"
+
+
+def reg_list_elem(base: str, reg_list: RegisterList) -> int:
+    """Bytes per register of an ldm/stm (4) or vldm/vstm (4 for s, 8 for d)."""
+    if base.startswith("v") and reg_list.regs[0].register_name.startswith("d"):
+        return 8
+    return 4
+
+
+def reg_list_type(base: str, reg: Register) -> Type:
+    if base.startswith("v"):
+        return vreg_type(reg)
+    return Type.reg32(likely_float=False)
 
 
 def other_f64_reg(reg: Register) -> Register:
@@ -1107,6 +1275,9 @@ class ArmArch(Arch):
                 arg not in HI_REGS for arg in instr.args
             ):
                 instr = replace(instr, mnemonic=instr.mnemonic + "s")
+        vfp = normalize_vfp(instr)
+        if vfp is not None:
+            return vfp
         return cls.normalize_instruction_real(instr)
 
     @classmethod
@@ -1312,6 +1483,39 @@ class ArmArch(Arch):
             jump_target = targets
             is_conditional = True
             eval_fn = lambda s, a: s.set_switch_expr(a.reg(0), just_index=True)
+        elif base in cls.instrs_fmac:
+            assert len(args) == 3 and isinstance(args[0], Register)
+            outputs = [args[0]]
+            inputs = get_inputs(0)
+            is_effectful = False
+
+            def eval_fn(s: NodeState, a: InstrArgs) -> None:
+                s.set_reg(a.reg_ref(0), cls.instrs_fmac[base](a))
+
+        elif base == "fcmp.s.fictive":
+            # vcmp/vcmpe; the vmrs that copies the flags is a nop. an unordered
+            # result (a NaN) is not modelled.
+            assert len(args) == 2 and isinstance(args[0], Register)
+            outputs = list(cls.flag_regs)
+            inputs = get_inputs(0)
+            is_effectful = False
+
+            def eval_fn(s: NodeState, a: InstrArgs) -> None:
+                lhs = as_f32(a.reg(0))
+                if isinstance(a.raw_arg(1), Register):
+                    rhs = as_f32(a.reg(1))
+                else:
+                    rhs = Literal(a.imm_value(1) & 0xFFFFFFFF, type=Type.f32())
+                s.set_reg(Register("z"), BinaryOp.fcmp(lhs, "==", rhs))
+                s.set_reg(Register("n"), BinaryOp.fcmp(lhs, "<", rhs))
+                s.set_reg(Register("c"), BinaryOp.fcmp(lhs, ">=", rhs))
+                s.set_reg(Register("hi"), BinaryOp.fcmp(lhs, ">", rhs))
+                s.set_reg(Register("ge"), BinaryOp.fcmp(lhs, ">=", rhs))
+                s.set_reg(Register("gt"), BinaryOp.fcmp(lhs, ">", rhs))
+                s.set_reg(
+                    Register("v"), fn_op("M2C_UNORDERED", [lhs, rhs], Type.boolean())
+                )
+
         elif base in cls.instrs_no_flags:
             assert not set_flags
             assert isinstance(args[0], Register)
@@ -1350,7 +1554,7 @@ class ArmArch(Arch):
                 s.set_reg_real(Register("r0"), div, function_return=True)
                 s.set_reg_real(Register("r1"), mod, function_return=True)
 
-        elif base == "ldm":
+        elif base in ("ldm", "vldm"):
             assert not set_flags
             assert direction in ("ia", "ib", "da", "db")
             assert isinstance(args[1], RegisterList)
@@ -1379,22 +1583,22 @@ class ArmArch(Arch):
             is_effectful = False
             is_load = True
 
+            elem = reg_list_elem(base, reg_list)
+
             def eval_fn(s: NodeState, a: InstrArgs) -> None:
                 loads: List[Expression] = []
                 for i in range(len(reg_list.regs)):
                     offset = get_ldm_stm_offset(i, len(reg_list.regs), direction)
-                    target = AddressMode(offset, base_reg)
-                    loads.append(deref(target, a.regs, a.stack_info, size=4))
+                    target = AddressMode(offset * elem // 4, base_reg)
+                    loads.append(deref(target, a.regs, a.stack_info, size=elem))
                 for r, v in zip(reg_list.regs, loads):
-                    s.set_reg(
-                        r, as_type(v, Type.reg32(likely_float=False), silent=True)
-                    )
+                    s.set_reg(r, as_type(v, reg_list_type(base, r), silent=True))
                 if writeback:
-                    imm = Literal(4 * len(reg_list.regs))
+                    imm = Literal(elem * len(reg_list.regs))
                     op = "+" if direction in ("ia", "ib") else "-"
                     s.set_reg(base_reg, BinaryOp.intptr(a.regs[base_reg], op, imm))
 
-        elif base == "stm":
+        elif base in ("stm", "vstm"):
             assert not set_flags
             assert direction in ("ia", "ib", "da", "db")
             assert isinstance(args[1], RegisterList)
@@ -1413,22 +1617,24 @@ class ArmArch(Arch):
             inputs.append(base_reg)
             is_store = True
 
+            elem = reg_list_elem(base, reg_list)
+
             def eval_fn(s: NodeState, a: InstrArgs) -> None:
                 for i, r in enumerate(reg_list.regs):
                     offset = get_ldm_stm_offset(i, len(reg_list.regs), direction)
-                    target = AddressMode(offset, base_reg)
+                    target = AddressMode(offset * elem // 4, base_reg)
                     store = make_store_real(
                         a.regs[r],
                         a.regs.get_raw(r),
                         target,
                         a.regs,
                         a.stack_info,
-                        Type.reg32(likely_float=False),
+                        reg_list_type(base, r),
                     )
                     if store is not None:
                         s.store_memory(store, r)
                 if writeback:
-                    imm = Literal(4 * len(reg_list.regs))
+                    imm = Literal(elem * len(reg_list.regs))
                     op = "+" if direction in ("ia", "ib") else "-"
                     s.set_reg(base_reg, BinaryOp.intptr(a.regs[base_reg], op, imm))
 
@@ -1745,6 +1951,7 @@ class ArmArch(Arch):
         )
 
     asm_patterns = [
+        DoubleWordPattern(),
         AddPcPcPattern(),
         ShortJumpTablePattern(),
         ConditionalInstrPattern(),
@@ -1833,6 +2040,40 @@ class ArmArch(Arch):
         "cvt.w.s.fictive": lambda a: handle_convert(a.reg(1), Type.s32(), Type.f32()),
         "cvt.u.d.fictive": lambda a: handle_convert(a.dreg(1), Type.u32(), Type.f64()),
         "cvt.u.s.fictive": lambda a: handle_convert(a.reg(1), Type.u32(), Type.f32()),
+        # VFP single precision (armcc)
+        "neg.s.fictive": lambda a: UnaryOp("-", as_f32(a.reg(1)), type=Type.f32()),
+        "abs.s.fictive": lambda a: fn_op("fabsf", [as_f32(a.reg(1))], Type.f32()),
+        "nmul.s.fictive": lambda a: UnaryOp(
+            "-", BinaryOp.f32(a.reg(1), "*", a.reg(2)), type=Type.f32()
+        ),
+        "mov.s.fictive": lambda a: as_f32(a.reg(1)),
+        "movimm.s.fictive": lambda a: Literal(
+            a.imm_value(1) & 0xFFFFFFFF, type=Type.f32()
+        ),
+        # vmov between a core and a VFP register: the bits, unchanged
+        "vmov.fictive": lambda a: a.reg(1),
+        # media extensions
+        "uxtb": lambda a: as_type(a.reg(1), Type.u8(), silent=False),
+        "uxth": lambda a: as_type(a.reg(1), Type.u16(), silent=False),
+        "sxtb": lambda a: as_type(a.reg(1), Type.s8(), silent=False),
+        "sxth": lambda a: as_type(a.reg(1), Type.s16(), silent=False),
+    }
+
+    instrs_fmac: InstrMap = {
+        "mla.s.fictive": lambda a: BinaryOp.f32(
+            a.reg(0), "+", BinaryOp.f32(a.reg(1), "*", a.reg(2))
+        ),
+        "mls.s.fictive": lambda a: BinaryOp.f32(
+            a.reg(0), "-", BinaryOp.f32(a.reg(1), "*", a.reg(2))
+        ),
+        "nmla.s.fictive": lambda a: BinaryOp.f32(
+            UnaryOp("-", as_f32(a.reg(0)), type=Type.f32()),
+            "-",
+            BinaryOp.f32(a.reg(1), "*", a.reg(2)),
+        ),
+        "nmls.s.fictive": lambda a: BinaryOp.f32(
+            BinaryOp.f32(a.reg(1), "*", a.reg(2)), "-", a.reg(0)
+        ),
     }
 
     instrs_float_comp: Mapping[str, Tuple[Cc, Callable[[InstrArgs], Condition]]] = {
@@ -2073,6 +2314,198 @@ class ArmArch(Arch):
         # (It's not perfect for u64's, but that's rare anyway.)
         return {
             Register("r0"): as_type(expr, Type.intptr(), silent=True, unify=False),
+            Register("r1"): fn_op("SECOND_REG", [expr], Type.reg32(likely_float=False)),
+        }
+
+
+class ArmCtrArch(ArmArch):
+    """Arch variant for the 3DS (armcc): the AAPCS-VFP calling convention, where
+    float arguments go in s0-s15 (doubles in d0-d7) apart from the core registers,
+    and a float is returned in s0."""
+
+    float_arg_regs = [Register(f"s{i}") for i in range(16)]
+    argument_regs = ArmArch.argument_regs + float_arg_regs
+    simple_temp_regs = (
+        [Register("r12")]
+        + [Register(f"d{i}") for i in range(8)]
+        + [Register(f"q{i}") for i in range(4)]
+    )
+    temp_regs = argument_regs + simple_temp_regs + ArmArch.flag_regs
+    saved_regs = ArmArch.saved_regs
+    all_regs = saved_regs + temp_regs + [ArmArch.stack_pointer_reg, Register("pc")]
+    base_return_regs = [(Register("r0"), False), (Register("s0"), True)]
+    all_return_regs = [Register("r0"), Register("r1"), Register("s0")]
+
+    def default_function_abi_candidate_slots(self) -> List[AbiArgSlot]:
+        return [
+            AbiArgSlot(ArgLoc(None, i, Register(f"r{i}")), Type.any_reg())
+            for i in range(4)
+        ] + [
+            AbiArgSlot(ArgLoc(None, 4 + i, reg), Type.floatish())
+            for i, reg in enumerate(self.float_arg_regs)
+        ]
+
+    def arg_name(self, loc: ArgLoc) -> str:
+        if loc.offset is not None:
+            return f"arg_sp{format_hex(loc.offset)}"
+        assert loc.reg is not None
+        name = loc.reg.register_name
+        if name.startswith("s"):
+            return f"farg{name[1:]}"
+        if name.startswith("d"):
+            return f"darg{name[1:]}"
+        return f"arg{name[1:]}"
+
+    def function_abi(
+        self,
+        fn_sig: FunctionSignature,
+        likely_regs: Dict[Register, bool],
+        *,
+        for_call: bool,
+    ) -> Abi:
+        """The AAPCS-VFP: core arguments as in ArmArch (r0-r3, then the stack),
+        floats in the first free s register, doubles in the first free even
+        pair (a d register); a single float may fill a hole a double left."""
+        known_slots: List[AbiArgSlot] = []
+        candidate_slots: List[AbiArgSlot] = []
+        if fn_sig.params_known:
+            offset = 0
+            index = 0
+            free_s = [True] * 16
+            if (
+                fn_sig.return_type.is_struct()
+                and fn_sig.return_type.get_parameter_size_align_bytes()[0] > 4
+            ):
+                known_slots.append(
+                    AbiArgSlot(
+                        ArgLoc(None, 0, Register("r0")),
+                        Type.ptr(fn_sig.return_type),
+                        name="__return__",
+                        comment="return",
+                    )
+                )
+                offset = 4
+                index = 1
+            for param in fn_sig.params:
+                param_type = param.type.decay()
+                size, align = param_type.get_parameter_size_align_bytes()
+                if param_type.is_float():
+                    reg: Optional[Register] = None
+                    if size == 4:
+                        for i in range(16):
+                            if free_s[i]:
+                                free_s[i] = False
+                                reg = Register(f"s{i}")
+                                break
+                    else:
+                        for i in range(0, 16, 2):
+                            if free_s[i] and free_s[i + 1]:
+                                free_s[i] = free_s[i + 1] = False
+                                reg = Register(f"d{i // 2}")
+                                break
+                    if reg is not None:
+                        known_slots.append(
+                            AbiArgSlot(
+                                ArgLoc(None, index, reg), param_type, name=param.name
+                            )
+                        )
+                        index += 1
+                        continue
+                    # out of VFP registers: on the stack (not modelled further)
+                    free_s = [False] * 16
+                size = (size + 3) & ~3
+                offset = (offset + align - 1) & -align
+                name = param.name
+                for i in range(offset // 4, (offset + size) // 4):
+                    unk_offset = 4 * i - offset
+                    reg2: Optional[Register] = None
+                    stack_loc: Optional[int] = None
+                    if i < 4:
+                        reg2 = Register(f"r{i}")
+                    else:
+                        stack_loc = (i - 4) * 4
+                    if size > 4:
+                        name2 = f"{name}_unk{unk_offset:X}" if name else None
+                        sub_type = Type.any()
+                        comment: Optional[str] = f"{param_type}+{unk_offset:#x}"
+                    else:
+                        name2 = name
+                        sub_type = param_type
+                        comment = None
+                    known_slots.append(
+                        AbiArgSlot(
+                            ArgLoc(stack_loc, index, reg2),
+                            sub_type,
+                            name=name2,
+                            comment=comment,
+                        )
+                    )
+                    index += 1
+                offset += size
+            if fn_sig.is_variadic:
+                # variadic arguments are never passed in VFP registers
+                for i in range(offset // 4, 4):
+                    candidate_slots.append(
+                        AbiArgSlot(ArgLoc(None, index, Register(f"r{i}")), Type.any_reg())
+                    )
+                    index += 1
+        else:
+            candidate_slots = self.default_function_abi_candidate_slots()
+
+        valid_extra_regs: Set[Register] = {
+            slot.loc.reg for slot in known_slots if slot.loc.reg is not None
+        }
+        possible_slots: List[AbiArgSlot] = []
+
+        # If register rX (sX) is likely, all previous ones are as well.
+        for prefix, count in (("r", 4), ("s", 16)):
+            lasti = -1
+            for i in range(count):
+                if Register(f"{prefix}{i}") not in likely_regs:
+                    break
+                lasti = i
+            for i in range(lasti, 0, -1):
+                if likely_regs[Register(f"{prefix}{i}")]:
+                    likely_regs[Register(f"{prefix}{i - 1}")] = True
+
+        first_of_kind: Set[str] = set()
+        for slot in candidate_slots:
+            reg = slot.loc.reg
+            if reg is None or reg not in likely_regs:
+                continue
+            name = reg.register_name
+            kind = name[0]
+            num = int(name[1:])
+            # Don't pass this register if lower numbered ones are undefined.
+            if kind not in first_of_kind and slot in (
+                candidate_slots[0],
+                *[c for c in candidate_slots if c.loc.reg == Register(f"{kind}0")],
+            ):
+                pass
+            elif num > 0 and Register(f"{kind}{num - 1}") not in valid_extra_regs:
+                continue
+            first_of_kind.add(kind)
+            valid_extra_regs.add(reg)
+            if not likely_regs[reg]:
+                continue
+            possible_slots.append(slot)
+
+        return Abi(
+            arg_slots=known_slots,
+            possible_slots=possible_slots,
+        )
+
+    @staticmethod
+    def function_return(expr: Expression) -> Dict[Register, Expression]:
+        # r0 (and r1 for a 64-bit value) or s0: put it in all of them, as the
+        # MIPS arch does with v0 and f0.
+        return {
+            Register("s0"): Cast(
+                expr, reinterpret=True, silent=True, type=Type.floatish()
+            ),
+            Register("r0"): Cast(
+                expr, reinterpret=True, silent=True, type=Type.intptr()
+            ),
             Register("r1"): fn_op("SECOND_REG", [expr], Type.reg32(likely_float=False)),
         }
 

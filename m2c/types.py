@@ -267,6 +267,16 @@ class TypeData:
 DEBUG_REPR_IDS: Dict[TypeData, int] = {}
 
 
+def is_m2c_unk(ctype: object) -> bool:
+    """Whether a context type is M2C_UNK (typedef int M2C_UNK;): a type left to
+    inference, for partial prototypes (a method whose `this` is known)."""
+    return (
+        isinstance(ctype, ca.TypeDecl)
+        and isinstance(ctype.type, ca.IdentifierType)
+        and ctype.type.names == ["M2C_UNK"]
+    )
+
+
 @dataclass(eq=False, repr=False)
 class Type:
     """
@@ -1100,6 +1110,10 @@ class Type:
         *,
         in_struct: bool = False,
     ) -> Type:
+        if is_m2c_unk(ctype):
+            # a type the context leaves to inference (typedef int M2C_UNK;): a
+            # partial prototype, e.g. a method whose `this` is known and nothing else
+            return Type.any_reg()
         real_ctype, _ = resolve_typedefs(ctype, typemap)
 
         if isinstance(real_ctype, ca.ArrayDecl):
@@ -1125,6 +1139,9 @@ class Type:
             )
             if fn.ret_type is not None:
                 fn_sig.return_type = Type.ctype(fn.ret_type, arch, typemap, typepool)
+                if is_m2c_unk(fn.ret_type):
+                    # unknown, void included: left to the usual guess
+                    fn_sig.return_type = Type.any()
             if fn.params is not None:
                 fn_sig.params = [
                     FunctionParam(

@@ -71,6 +71,7 @@ from .types import (
     FunctionSignature,
     StructDeclaration,
     Type,
+    TypeData,
     TypePool,
 )
 
@@ -4809,8 +4810,11 @@ def translate_to_ast(
     return_reg: Optional[Tuple[Register, bool]] = None
 
     if not options.void and not return_type.is_void():
+        # a return type left to inference (M2C_UNK in the context) is guessed as
+        # if no prototype were given
+        unknown_return = return_type.data().kind == TypeData.K_ANY
         return_reg = determine_return_register(
-            return_blocks, fn_sym.type_provided, arch
+            return_blocks, fn_sym.type_provided and not unknown_return, arch
         )
 
     if return_reg is not None:
